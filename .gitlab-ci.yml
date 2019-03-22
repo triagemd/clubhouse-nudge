@@ -1,0 +1,156 @@
+#       ____                                    ____________
+#      / __ \____ _      _____  _________  ____/ /  _/_  __/
+#     / /_/ / __ \ | /| / / _ \/ ___/ __ \/ __  // /  / /
+#    / ____/ /_/ / |/ |/ /  __/ /  / /_/ / /_/ // /  / /
+#   /_/    \____/|__/|__/\___/_/   \____/\__,_/___/ /_/
+#   
+#   Copyright: Roderick Jonsson <rj@powerodit.ch>
+
+stages:
+  - build
+  - staging
+  - production
+
+variables:
+  CHART_PATH: ./charts/${CI_PROJECT_NAME}
+  CONTAINER_IMAGE_BUILT: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}_${CI_COMMIT_SHA}
+  CONTAINER_IMAGE_LATEST: ${CI_REGISTRY_IMAGE}:latest
+  DOCKER_DRIVER: overlay2
+  DOCKER_HOST: tcp://docker:2375/  # required since we use dind
+
+  K8S_SECRET_NAME: ${CI_PROJECT_NAME}-${CI_PROJECT_ID}
+  RELEASE_NAME: ${CI_PROJECT_NAME}-${CI_PROJECT_ID}
+
+  KUBERNETES_VERSION: 1.8.6
+  HELM_VERSION: 2.6.1
+
+build:
+  stage: build
+  image: docker:stable
+  services:
+  - docker:dind
+  script:
+    - build
+  only:
+    refs:
+    - master
+    - staging
+
+staging:
+  image: alpine:latest
+  stage: staging
+  script:
+    - install_dependencies
+    - ensure_namespace
+    - install_tiller
+    - create_secret
+    - deploy
+  environment:
+    name: staging
+    url: http://$DOMAIN_NAME
+  only:
+    refs:
+      - branches
+    kubernetes: active
+  except:
+    - master
+  variables:
+    DEPLOY_NAMESPACE: staging
+    TILLER_NAMESPACE: staging
+  when: manual
+
+
+production:
+  image: alpine:latest
+  stage: production
+  script:
+    - install_dependencies
+    - ensure_namespace
+    - install_tiller
+    - create_secret
+    - deploy
+  environment:
+    name: production
+    url: http://$DOMAIN_NAME
+  only:
+    refs:
+      - master
+    kubernetes: active
+  variables:
+    DEPLOY_NAMESPACE: production
+    TILLER_NAMESPACE: production
+  when: manual
+
+# ---------------------------------------------------------------------------
+
+.auto_devops: &auto_devops |
+
+  [[ "$TRACE" ]] && set -x
+
+  function build() {
+    echo "Building Dockerfile-based application..."
+    docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+    docker build -t ${CONTAINER_IMAGE_BUILT} .
+    echo "Pushing to the Container Registry..."
+    docker push ${CONTAINER_IMAGE_BUILT}
+  }
+
+  function install_dependencies() {
+    apk add -U openssl curl tar gzip bash ca-certificates git
+    wget -q -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub
+    wget https://github.com/sgerrand/alpine-pkg-glibc/releases/download/2.23-r3/glibc-2.23-r3.apk
+    apk add glibc-2.23-r3.apk
+    rm glibc-2.23-r3.apk
+
+    curl "https://kubernetes-helm.storage.googleapis.com/helm-v${HELM_VERSION}-linux-amd64.tar.gz" | tar zx
+    mv linux-amd64/helm /usr/bin/
+    helm version --client
+
+    curl -L -o /usr/bin/kubectl "https://storage.googleapis.com/kubernetes-release/release/v${KUBERNETES_VERSION}/bin/linux/amd64/kubectl"
+    chmod +x /usr/bin/kubectl
+    kubectl version --client
+  }
+
+  function ensure_namespace() {
+    kubectl describe namespace "$DEPLOY_NAMESPACE" || kubectl create namespace "$DEPLOY_NAMESPACE"
+  }
+
+  function install_tiller() {
+    echo "Checking Tiller..."
+    helm init --upgrade
+    kubectl rollout status -n "$TILLER_NAMESPACE" -w "deployment/tiller-deploy"
+    if ! helm version --debug; then
+      echo "Failed to init Tiller."
+      return 1
+    fi
+    echo ""
+  }
+
+  function create_secret() {
+    echo "Create secret..."
+
+    kubectl create secret -n "$DEPLOY_NAMESPACE" \
+      docker-registry "$K8S_SECRET_NAME" \
+      --docker-server="$CI_REGISTRY" \
+      --docker-username="${CI_DEPLOY_USER}" \
+      --docker-password="${CI_DEPLOY_PASSWORD}" \
+      --docker-email="$GITLAB_USER_EMAIL" \
+      -o yaml --dry-run | kubectl replace -n "$DEPLOY_NAMESPACE" --force -f -
+  }
+
+  function deploy_dry_run() {
+    echo "Dry Run"
+  }
+
+  function deploy() {
+    helm init --client-only
+    helm upgrade --install \
+      --set image.repository=${CONTAINER_IMAGE_BUILT} \
+      --set image.pullSecrets=${K8S_SECRET_NAME} \
+      --wait \
+      --namespace=${DEPLOY_NAMESPACE} \
+      ${RELEASE_NAME} ${CHART_PATH}
+  }
+
+before_script:
+  - *auto_devops

@@ -1,0 +1,19 @@
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: clubhouse-nudge
+spec:
+  schedule: "0 10 * * 1"
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: clubhouse-nudge
+        spec:
+          containers:
+          - name: clubhouse-nudge
+            image: "{{ .Values.image.repository }}"
+          restartPolicy: OnFailure
+          imagePullSecrets:
+            - name: "{{ .Values.image.pullSecrets }}"
